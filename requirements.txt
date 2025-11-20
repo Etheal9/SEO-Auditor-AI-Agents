@@ -1,0 +1,10 @@
+pydantic
+google-generativeai
+firecrawl-py
+ddgs
+python-dotenv
+groq
+langgraph
+langchain
+langsmith
+tenacity

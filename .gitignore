@@ -1,0 +1,7 @@
+.env
+memory/state.json
+.venv
+*.log
+error.log
+__pycache__
+.vscode
