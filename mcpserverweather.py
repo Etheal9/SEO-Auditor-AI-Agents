@@ -1,9 +1,9 @@
-import os
+fimport os
 import requests
 from langchain_core.tools import tool
 
 
-@tool
+@mcp.tool
 def get_weather_data(location: str) -> str:
     """
     Provides real-time weather information for a given location using the OpenWeatherMap API.

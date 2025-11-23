@@ -8,3 +8,6 @@ langgraph
 langchain
 langsmith
 tenacity
+langchain-openai
+langchain-google-genai
+streamlit

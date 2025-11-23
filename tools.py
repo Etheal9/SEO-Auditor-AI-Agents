@@ -1,40 +1,22 @@
 import os
 import json
-# Conditional import for Gemini or Groq
-try:
-    import google.generativeai as genai
-except ImportError:
-    genai = None
-try:
-    from groq import Groq
-except ImportError:
-    Groq = None
-from duckduckgo_search import DDGS
-from typing import List, Dict, Any, Optional, Type
+import traceback
+from typing import List, Dict, Any, Optional, Type, Callable
 from pydantic import BaseModel
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-import traceback
 
-# Configure Gemini
-# Configure the appropriate LLM client based on available keys
-if os.getenv("GROQ_API_KEY") and Groq:
-    # Groq client will be instantiated per LlmAgent instance
-    pass
-elif os.getenv("GEMINI_API_KEY") and genai:
-    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-else:
-    raise RuntimeError("No valid LLM API key found. Set either GROQ_API_KEY or GEMINI_API_KEY.")
+# LangChain Imports
+#
+import google.generativeai as genai
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from langchain_core.tools import tool as tool_decorator
+from langchain_core.utils.function_calling import convert_to_openai_tool
 
-class AgentTool:
-    """
-    Wrapper for tools to be used by agents.
-    """
-    def __init__(self, func):
-        self.func = func
-        self.name = func.__name__
+# Search Tools
+from duckduckgo_search import DDGS
 
-    def __call__(self, *args, **kwargs):
-        return self.func(*args, **kwargs)
+# --- 1. Tool Definitions ---
 
 class GoogleSearch:
     """
@@ -51,7 +33,6 @@ class GoogleSearch:
         results = []
         try:
             # ddgs.text returns a generator, so we listify it
-            # max_results=10 to match the requirement
             search_results = list(self.ddgs.text(query, max_results=10))
             for result in search_results:
                 results.append({
@@ -63,38 +44,19 @@ class GoogleSearch:
             print(f"  [Search Error] {e}")
         return results
 
-google_search = GoogleSearch()
+google_search_instance = GoogleSearch()
 
-# Mock MCPToolset for now since we don't have a full MCP client implementation in this context
-# In a real scenario, this would connect to an MCP server.
-# We will wrap the firecrawl tool if possible, or mock it if the user doesn't have the server running.
-# Given the environment, we'll assume we can't easily spawn an MCP server subprocess here without more setup.
-# However, the original code imported MCPToolset. We will replace it with a placeholder or a direct API call if possible.
-# For this fix, we will create a mock class that warns if used, or tries to use the API directly if key is present.
-# Actually, let's try to implement a basic wrapper if the user has the library, but since we are fixing the code,
-# let's stick to a simple implementation that can be extended.
+# We wrap this as a standalone function for LangChain to bind easily
+def google_search(query: str) -> str:
+    """
+    Performs a web search for the given query and returns the top results as a JSON string.
+    """
+    results = google_search_instance.search(query)
+    return json.dumps(results)
 
-class MCPToolset:
-    def __init__(self, connection_params, tool_filter):
-        self.connection_params = connection_params
-        self.tool_filter = tool_filter
 
-    def __call__(self, *args, **kwargs):
-        # This is a placeholder. In a real app, this would invoke the MCP tool.
-        # For the purpose of this "fix", we might need to mock the firecrawl output 
-        # OR implement a direct API call if the user has the key.
-        # Let's assume for now we just return a mock response if called, 
-        # or we can try to use the firecrawl-py library directly if installed.
-        pass
-
-class StdioServerParameters:
-    def __init__(self, command, args, env):
-        self.command = command
-        self.args = args
-        self.env = env
-
+# Firecrawl Tool
 # Re-implementing firecrawl_toolset to use the direct library if available, or mock.
-# The original code used `firecrawl-mcp`. We'll switch to `firecrawl-py` as per requirements.
 try:
     from firecrawl import FirecrawlApp
     
@@ -102,186 +64,149 @@ try:
         def __init__(self):
             self.app = FirecrawlApp(api_key=os.getenv("FIRECRAWL_API_KEY"))
 
-        def scrape(self, url: str, formats: List[str] = None, onlyMainContent: bool = True, timeout: int = 90000):
+        def scrape(self, url: str) -> str:
+            """
+            Scrapes the provided URL to extract markdown content.
+            """
             print(f"  [Firecrawl] Scraping {url}...")
             try:
-                # Map parameters to firecrawl-py expected format
                 params = {
-                    "formats": formats or ["markdown", "html"],
-                    "onlyMainContent": onlyMainContent,
-                    "timeout": timeout
+                    "formats": ["markdown", "html"],
+                    "onlyMainContent": True,
+                    "timeout": 90000
                 }
                 scrape_result = self.app.scrape_url(url, params=params)
-                return scrape_result
+                return json.dumps(scrape_result)
             except Exception as e:
                 print(f"  [Firecrawl Error] {e}")
-                return {"error": str(e)}
+                return json.dumps({"error": str(e)})
 
     firecrawl_instance = None
     
-    def firecrawl_scrape(url: str, formats: List[str] = None, onlyMainContent: bool = True, timeout: int = 90000):
+    def firecrawl_scrape(url: str) -> str:
+        """
+        Scrapes a website URL and returns the content in markdown format.
+        """
         global firecrawl_instance
         if firecrawl_instance is None:
              firecrawl_instance = FirecrawlTool()
-        return firecrawl_instance.scrape(url, formats, onlyMainContent, timeout)
+        return firecrawl_instance.scrape(url)
 
-    firecrawl_toolset = firecrawl_scrape # Expose as a function
+    firecrawl_toolset = firecrawl_scrape 
 
 except ImportError:
     print("Warning: firecrawl-py not installed or failed to import.")
-    def firecrawl_toolset(*args, **kwargs):
-        return {"error": "Firecrawl library not available."}
+    def firecrawl_toolset(url: str) -> str:
+        return json.dumps({"error": "Firecrawl library not available."})
 
+
+# --- 2. Unified LLM Agent (LangChain Powered) ---
 
 class LlmAgent:
-    def __init__(self, name: str, model: str, description: str, instruction: str, tools: List[Any] = None, output_schema: Type[BaseModel] = None, output_key: str = None):
+    def __init__(self, name: str, model: str, description: str, instruction: str, tools: List[Callable] = None, output_schema: Type[BaseModel] = None, output_key: str = None):
         self.name = name
-        self.model_name = model
         self.description = description
         self.instruction = instruction
         self.tools = tools or []
         self.output_schema = output_schema
         self.output_key = output_key
         
-        # Initialize Gemini model
-        # We map the model name to a valid Gemini model if needed, or use the one provided.
-        # "gemini-2.5-flash" might not exist, defaulting to "gemini-1.5-flash" or "gemini-pro" if needed.
-        # But let's trust the user's string or fallback.
-        valid_model = "gemini-1.5-flash" # Fallback
-        if "gemini" in model:
-             valid_model = model # Try to use what's given, or let it fail if invalid
+        # --- Dynamic LLM Selection ---
+        self.llm = self._get_llm_client(model)
         
-        # Prepare tools for Gemini
-        self.gemini_tools = []
-        for tool in self.tools:
-            if isinstance(tool, AgentTool):
-                self.gemini_tools.append(tool.func)
-            elif callable(tool):
-                self.gemini_tools.append(tool)
-            elif hasattr(tool, 'search'): # Handle GoogleSearch object
-                self.gemini_tools.append(tool.search)
-
-        # Initialize model based on available backend
-        # CRITICAL FIX: Groq implementation here does NOT support tool calling.
-        # If tools are provided, we MUST use Gemini if available.
-        use_groq = False
-        if os.getenv("GROQ_API_KEY") and Groq:
-            use_groq = True
-            # If this agent needs tools, check if we can use Gemini instead
-            if self.tools and genai and os.getenv("GEMINI_API_KEY"):
-                print(f"  [Info] Agent {self.name} has tools. Preferring Gemini over Groq for tool support.")
-                use_groq = False
-        
-        if use_groq:
-            # Groq path (no native tool calling in this simple implementation)
-            self.groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-            self.model_name = "llama3-70b-8192" # Use a better model than the placeholder
-        elif genai:
-            self.model = genai.GenerativeModel(
-                model_name=valid_model,
-                tools=self.gemini_tools if self.gemini_tools else None,
-                system_instruction=instruction
-            )
+        # Bind tools if supported
+        if self.tools:
+            # Convert python functions to LangChain tools
+            self.lc_tools = [tool_decorator(t) for t in self.tools]
+            self.llm_with_tools = self.llm.bind_tools(self.lc_tools)
         else:
-            raise RuntimeError("No LLM backend available.")
+            self.llm_with_tools = self.llm
+
+    def _get_llm_client(self, requested_model: str):
+        """
+        Selects the best available LLM backend based on .env keys.
+        Currently only supports Gemini via Google GenAI.
+        """
+        
+        # 2. Gemini (Google)
+        if os.getenv("GEMINI_API_KEY"):
+            print(f"  [Init] Agent '{self.name}' using Gemini.")
+            return ChatGoogleGenerativeAI(
+                model="gemini-1.5-flash",
+                google_api_key=os.getenv("GEMINI_API_KEY"),
+                temperature=0
+            )
+            
+        else:
+            raise RuntimeError("No valid LLM API key found (GEMINI). Check .env.")
 
     def run(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         print(f"\n--- Running Agent: {self.name} ---")
         
-        # Construct prompt from input
-        prompt = f"Input Data: {json.dumps(input_data, indent=2)}\n\nPlease process this input according to your instructions."
+        # Construct Prompt
+        prompt_text = f"Input Data: {json.dumps(input_data, indent=2)}\n\nPlease process this input according to your instructions."
+        messages = [
+            SystemMessage(content=self.instruction),
+            HumanMessage(content=prompt_text)
+        ]
         
-        # Groq path (no tool calling support)
-        if hasattr(self, "groq_client"):
-            try:
-                response = self.groq_client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[{"role": "system", "content": self.instruction},
-                              {"role": "user", "content": prompt}]
-                )
-                output_text = response.choices[0].message.content
-            except Exception as e:
-                print(f"  [Error] Groq request failed: {e}")
-                return {"error": str(e)}
-        else:
-            # Gemini path (original behavior with tool calling)
-            try:
-                chat = self.model.start_chat(enable_automatic_function_calling=True)
-                response = chat.send_message(prompt)
-                output_text = response.text
-            except Exception as e:
-                print(f"  [Error] Agent execution failed: {e}")
-                return {"error": str(e)}
-        # Parse output (common for both backends)
-        if self.output_schema:
-            try:
-                cleaned_text = output_text.replace("```json", "").replace("```", "").strip()
-                json_data = json.loads(cleaned_text)
-                validated_data = self.output_schema(**json_data)
-                if self.output_key:
-                    return {self.output_key: validated_data.model_dump()}
-                return validated_data.model_dump()
-            except json.JSONDecodeError:
-                print(f"  [Error] Failed to parse JSON output from {self.name}")
-                print(f"  [Raw Output] {output_text}")
-                return {"error": "Failed to parse JSON", "raw_output": output_text}
-            except Exception as e:
-                print(f"  [Error] Validation failed: {e}")
-                return {"error": str(e), "raw_output": output_text}
-        else:
-            if self.output_key:
-                return {self.output_key: output_text}
-            return {"output": output_text}
-
-class SequentialAgent:
-    def __init__(self, name: str, description: str, sub_agents: List[LlmAgent]):
-        self.name = name
-        self.description = description
-        self.sub_agents = sub_agents
-
-    def run(self, initial_input: Dict[str, Any]) -> Dict[str, Any]:
-        print(f"Starting Sequential Workflow: {self.name}")
-        state = initial_input.copy()
-        
-        for agent in self.sub_agents:
-            agent_output = agent.run(state)
+        try:
+            # Invoke LLM
+            response = self.llm_with_tools.invoke(messages)
             
-            # Update state with agent output
-            if isinstance(agent_output, dict):
-                state.update(agent_output)
-            else:
-                # Should not happen with current LlmAgent implementation
-                state[agent.name] = agent_output
+            # Handle Tool Calls (Simple Loop)
+            # Note: In a full LangGraph, this would be a node loop. 
+            # Here we do a simple local loop for the agent's turn.
+            if response.tool_calls:
+                print(f"  [Tool Call] {len(response.tool_calls)} tool(s) called.")
+                messages.append(response) # Add AI message with tool calls
                 
-        return state
+                for tool_call in response.tool_calls:
+                    tool_name = tool_call["name"]
+                    tool_args = tool_call["args"]
+                    
+                    # Find the matching tool function
+                    selected_tool = next((t for t in self.lc_tools if t.name == tool_name), None)
+                    
+                    if selected_tool:
+                        print(f"  [Executing] {tool_name} with {tool_args}")
+                        tool_output = selected_tool.invoke(tool_args)
+                        messages.append(ToolMessage(tool_call_id=tool_call["id"], content=str(tool_output)))
+                    else:
+                        print(f"  [Error] Tool {tool_name} not found.")
+                        messages.append(ToolMessage(tool_call_id=tool_call["id"], content="Error: Tool not found"))
+                
+                # Get final response after tools
+                final_response = self.llm_with_tools.invoke(messages)
+                output_text = final_response.content
+            else:
+                output_text = response.content
 
-# Helper for the search agent in tools.py (original file had this)
-search_executor_agent = LlmAgent(
-    name="perform_google_search",
-    model="gemini-1.5-flash",
-    description="Executes Google searches for provided queries and returns structured results.",
-    instruction="""The latest user message contains the keyword to search.
-     - Call google_search with that exact query and fetch the top organic results (aim for 10).
-     - Respond with JSON text containing the query and an array of result objects (title, url, snippet). Use an empty array when nothing is returned.
-     - No additional commentary—return JSON only.""",
-    tools=[google_search],
-)
+            # Parse Output
+            if self.output_schema:
+                try:
+                    # Clean markdown code blocks if present
+                    cleaned_text = str(output_text).replace("```json", "").replace("```", "").strip()
+                    json_data = json.loads(cleaned_text)
+                    validated_data = self.output_schema(**json_data)
+                    if self.output_key:
+                        return {self.output_key: validated_data.model_dump()}
+                    return validated_data.model_dump()
+                except Exception as e:
+                    print(f"  [Error] JSON Validation failed: {e}")
+                    return {"error": "Failed to parse JSON", "raw_output": output_text}
+            else:
+                if self.output_key:
+                    return {self.output_key: output_text}
+                return {"output": output_text}
 
-google_search_tool = AgentTool(search_executor_agent.run) # Wrap the run method? 
-# Actually, the original code used `google_search_tool` as a tool passed to `SerpAnalystAgent`.
-# But `SerpAnalystAgent` instruction says "Call perform_google_search tool".
-# So we should expose the search function directly or the agent.
-# Let's expose the `google_search.search` method as the tool for `SerpAnalystAgent`.
-# The `search_executor_agent` seems redundant if we just use the tool directly.
-# But let's keep `google_search_tool` as a callable that `SerpAnalystAgent` can use.
-# Wait, `SerpAnalystAgent` uses `google_search_tool`.
-# If `google_search_tool` is an `AgentTool` wrapping `search_executor_agent`, then calling it runs the agent.
-# Let's simplify: `SerpAnalystAgent` needs a tool to search. `google_search.search` is that tool.
-# So let's redefine `google_search_tool` to be `google_search.search`.
+        except Exception as e:
+            print(f"  [Error] Agent execution failed: {e}")
+            traceback.print_exc()
+            return {"error": str(e)}
 
-google_search_tool = google_search.search
 
-# --- Resilience & Memory Helpers ---
+# --- 3. Resilience & Memory Helpers ---
 
 def run_with_retries(func, *args, **kwargs):
     """
@@ -300,7 +225,6 @@ def run_with_retries(func, *args, **kwargs):
         return wrapper()
     except Exception as e:
         print(f"  [Retry Failed] Function {func.__name__} failed after retries: {e}")
-        traceback.print_exc()
         raise e
 
 MEMORY_FILE = os.path.join(os.path.dirname(__file__), "memory", "state.json")
@@ -324,3 +248,7 @@ def save_memory(state: Dict[str, Any]):
     except Exception as e:
         print(f"  [Memory] Failed to save memory: {e}")
 
+# Export tools for agents.py
+# Note: agents.py expects these to be callables or list of callables
+# In the new LlmAgent, we pass the raw functions, and it converts them.
+google_search_tool = google_search
